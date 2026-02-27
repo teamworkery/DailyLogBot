@@ -9,12 +9,15 @@ import json
 import logging
 import os
 import requests
-from datetime import date, time
+from datetime import datetime, time, timezone, timedelta
 from pathlib import Path
 from dotenv import load_dotenv
 from anthropic import Anthropic
 from telegram import Update
 from telegram.ext import Application, MessageHandler, filters, ContextTypes
+
+# 한국 표준시 (KST = UTC+9)
+KST = timezone(timedelta(hours=9))
 
 # ─────────────────────────────────────────────
 # 설정 로드
@@ -52,7 +55,12 @@ def load_state() -> dict:
     if STATE_FILE.exists():
         with open(STATE_FILE, encoding="utf-8") as f:
             return json.load(f)
-    return {"awaiting_reply": False, "last_question_date": None, "replied_dates": []}
+    return {
+        "last_question_date": None,
+        "today_page_id": None,
+        "today_page_date": None,
+        "today_messages": [],
+    }
 
 
 def save_state(state: dict):
@@ -64,11 +72,18 @@ def save_state(state: dict):
 # 오후 5시: 일기 질문 발송
 # ─────────────────────────────────────────────
 async def send_daily_question(context: ContextTypes.DEFAULT_TYPE):
-    today = str(date.today())
+    today = str(datetime.now(KST).date())
     state = load_state()
 
     if state.get("last_question_date") == today:
         logger.info(f"[{today}] 이미 오늘 질문을 보냈습니다. 건너뜁니다.")
+        return
+
+    # 이미 오늘 메시지를 보낸 적이 있으면 질문 생략
+    if state.get("today_page_date") == today and state.get("today_messages"):
+        logger.info(f"[{today}] 이미 오늘 메시지가 있어 질문을 건너뜁니다.")
+        state["last_question_date"] = today
+        save_state(state)
         return
 
     text = (
@@ -80,7 +95,6 @@ async def send_daily_question(context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=text)
 
     state["last_question_date"] = today
-    state["awaiting_reply"] = True
     save_state(state)
 
     logger.info(f"[{today}] 일기 질문을 발송했습니다.")
@@ -94,43 +108,52 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.id != TELEGRAM_CHAT_ID:
         return
 
-    state = load_state()
-    today = str(date.today())
-
-    # 답변 대기 중이 아니면 무시
-    if not state.get("awaiting_reply"):
-        return
-
-    # 오늘 이미 답변을 저장했으면 무시
-    if today in state.get("replied_dates", []):
-        await update.message.reply_text("📝 오늘 일기는 이미 저장되어 있어요!")
-        return
-
     reply_text = update.message.text or ""
     if not reply_text.strip():
         return
 
+    state = load_state()
+    today = str(datetime.now(KST).date())
+
+    # 날짜가 바뀌었으면 상태 초기화
+    if state.get("today_page_date") != today:
+        state["today_page_id"] = None
+        state["today_page_date"] = today
+        state["today_messages"] = []
+
+    is_first = state.get("today_page_id") is None
+
     # ── 처리 중 메시지 ──
-    await update.message.reply_text("⏳ 일기를 정리하고 있어요...")
+    if is_first:
+        await update.message.reply_text("⏳ 일기를 정리하고 있어요...")
+    else:
+        await update.message.reply_text("⏳ 추가 내용을 저장하고 있어요...")
 
-    # ── Anthropic으로 AI 요약 ──
-    logger.info(f"[{today}] AI 요약 생성 중...")
-    ai_summary = summarize_with_anthropic(reply_text, today)
+    # ── 메시지 누적 ──
+    state.setdefault("today_messages", [])
+    state["today_messages"].append(reply_text)
 
-    # ── Notion에 저장 ──
-    logger.info(f"[{today}] Notion에 저장 중...")
-    notion_url = save_to_notion(today, reply_text, ai_summary)
+    # ── 전체 메시지로 AI 요약 ──
+    all_text = "\n\n".join(state["today_messages"])
+    logger.info(f"[{today}] AI 요약 생성 중... (메시지 {len(state['today_messages'])}개)")
+    ai_summary = summarize_with_anthropic(all_text, today)
 
-    # ── 상태 업데이트 ──
-    state["awaiting_reply"] = False
-    if "replied_dates" not in state:
-        state["replied_dates"] = []
-    state["replied_dates"].append(today)
+    if is_first:
+        # ── 첫 메시지: Notion 페이지 생성 ──
+        logger.info(f"[{today}] Notion 페이지 생성 중...")
+        page_id, notion_url = create_notion_page(today, reply_text, ai_summary)
+        state["today_page_id"] = page_id
+    else:
+        # ── 추가 메시지: 기존 페이지에 append ──
+        page_id = state["today_page_id"]
+        logger.info(f"[{today}] Notion 페이지에 추가 중... (page_id={page_id})")
+        notion_url = append_to_notion(page_id, reply_text, all_text, ai_summary)
+
     save_state(state)
 
     # ── 완료 메시지 ──
     result_msg = (
-        f"✅ 저장 완료!\n\n"
+        f"✅ {'저장' if is_first else '추가 저장'} 완료!\n\n"
         f"🤖 *AI 요약:*\n{ai_summary}"
     )
     if notion_url:
@@ -165,15 +188,20 @@ def summarize_with_anthropic(text: str, date_str: str) -> str:
 
 
 # ─────────────────────────────────────────────
-# Notion API: 페이지 생성
+# Notion API 공통 헤더
 # ─────────────────────────────────────────────
-def save_to_notion(date_str: str, reply_text: str, ai_summary: str) -> str:
-    headers = {
-        "Authorization": f"Bearer {NOTION_TOKEN}",
-        "Content-Type": "application/json",
-        "Notion-Version": "2022-06-28",
-    }
+NOTION_HEADERS = {
+    "Authorization": f"Bearer {NOTION_TOKEN}",
+    "Content-Type": "application/json",
+    "Notion-Version": "2022-06-28",
+}
 
+
+# ─────────────────────────────────────────────
+# Notion API: 페이지 생성 (첫 메시지)
+# ─────────────────────────────────────────────
+def create_notion_page(date_str: str, reply_text: str, ai_summary: str) -> tuple[str | None, str]:
+    """Notion 데이터베이스에 새 페이지를 생성하고 (page_id, url) 반환."""
     body = {
         "parent": {"database_id": NOTION_DATABASE_ID},
         "properties": {
@@ -214,12 +242,71 @@ def save_to_notion(date_str: str, reply_text: str, ai_summary: str) -> str:
     }
 
     try:
-        resp = requests.post("https://api.notion.com/v1/pages", headers=headers, json=body, timeout=15)
+        resp = requests.post(
+            "https://api.notion.com/v1/pages",
+            headers=NOTION_HEADERS, json=body, timeout=15,
+        )
         resp.raise_for_status()
-        return resp.json().get("url", "")
+        data = resp.json()
+        return data.get("id"), data.get("url", "")
     except Exception as e:
-        logger.error(f"Notion API 오류: {e}")
-        return ""
+        logger.error(f"Notion 페이지 생성 오류: {e}")
+        return None, ""
+
+
+# ─────────────────────────────────────────────
+# Notion API: 기존 페이지에 추가 (추가 메시지)
+# ─────────────────────────────────────────────
+def append_to_notion(page_id: str, new_text: str, all_text: str, ai_summary: str) -> str:
+    """기존 Notion 페이지에 추가 원문 블록을 append 하고, 일기 속성(요약)을 갱신."""
+    notion_url = ""
+
+    # 1) 블록 append: 추가 원문
+    append_body = {
+        "children": [
+            {"object": "block", "type": "divider", "divider": {}},
+            {
+                "object": "block", "type": "paragraph",
+                "paragraph": {"rich_text": [{"type": "text", "text": {"content": f"📝 추가:\n{new_text}"}}]}
+            },
+        ]
+    }
+    try:
+        resp = requests.patch(
+            f"https://api.notion.com/v1/blocks/{page_id}/children",
+            headers=NOTION_HEADERS, json=append_body, timeout=15,
+        )
+        resp.raise_for_status()
+    except Exception as e:
+        logger.error(f"Notion 블록 append 오류: {e}")
+
+    # 2) 일기 속성 갱신: 전체 원문 + 새 요약
+    summary_content = f"📝 원문:\n{all_text}\n\n🤖 AI 요약:\n{ai_summary}"
+    # Notion rich_text 속성은 최대 2000자
+    if len(summary_content) > 2000:
+        summary_content = summary_content[:1997] + "..."
+
+    update_body = {
+        "properties": {
+            "일기": {
+                "rich_text": [{
+                    "type": "text",
+                    "text": {"content": summary_content}
+                }]
+            }
+        }
+    }
+    try:
+        resp = requests.patch(
+            f"https://api.notion.com/v1/pages/{page_id}",
+            headers=NOTION_HEADERS, json=update_body, timeout=15,
+        )
+        resp.raise_for_status()
+        notion_url = resp.json().get("url", "")
+    except Exception as e:
+        logger.error(f"Notion 속성 갱신 오류: {e}")
+
+    return notion_url
 
 
 # ─────────────────────────────────────────────
@@ -234,10 +321,10 @@ def main():
     # 메시지 핸들러 등록
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    # 매일 지정 시간에 질문 발송
+    # 매일 지정 시간에 질문 발송 (KST 기준)
     app.job_queue.run_daily(
         callback=send_daily_question,
-        time=time(hour=QUESTION_HOUR, minute=QUESTION_MINUTE, second=0),
+        time=time(hour=QUESTION_HOUR, minute=QUESTION_MINUTE, second=0, tzinfo=KST),
         days=(0, 1, 2, 3, 4, 5, 6),
         name="daily_question",
     )
