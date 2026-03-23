@@ -1,8 +1,8 @@
 """
 Daily Journal Bot
 =================
-매일 오후 5시에 Telegram으로 일기 질문을 보내고,
-답변을 받아 AI로 요약한 뒤 Notion에 저장합니다.
+텔레그램으로 수시로 활동을 기록하면 Notion 상세DB에 즉시 저장하고,
+매일 오후 5시에 하루 기록을 AI로 요약하여 메인DB에 저장합니다.
 """
 
 import json
@@ -29,6 +29,7 @@ TELEGRAM_CHAT_ID     = int(os.getenv("TELEGRAM_CHAT_ID", "0"))
 ANTHROPIC_API_KEY    = os.getenv("ANTHROPIC_API_KEY")
 NOTION_TOKEN         = os.getenv("NOTION_TOKEN")
 NOTION_DATABASE_ID   = os.getenv("NOTION_DATABASE_ID")
+NOTION_DETAIL_DB_ID  = os.getenv("NOTION_DETAIL_DATABASE_ID")
 QUESTION_HOUR        = int(os.getenv("QUESTION_HOUR", "17"))   # 기본: 오후 5시
 QUESTION_MINUTE      = int(os.getenv("QUESTION_MINUTE", "0"))
 
@@ -49,7 +50,7 @@ logger = logging.getLogger(__name__)
 
 
 # ─────────────────────────────────────────────
-# 상태 관리 (오늘 질문 발송 여부, 답변 수신 여부)
+# 상태 관리
 # ─────────────────────────────────────────────
 def load_state() -> dict:
     if STATE_FILE.exists():
@@ -59,7 +60,6 @@ def load_state() -> dict:
         "last_question_date": None,
         "today_page_id": None,
         "today_page_date": None,
-        "today_messages": [],
     }
 
 
@@ -69,42 +69,19 @@ def save_state(state: dict):
 
 
 # ─────────────────────────────────────────────
-# 오후 5시: 일기 질문 발송
+# Notion API 공통 헤더
 # ─────────────────────────────────────────────
-async def send_daily_question(context: ContextTypes.DEFAULT_TYPE):
-    today = str(datetime.now(KST).date())
-    state = load_state()
-
-    if state.get("last_question_date") == today:
-        logger.info(f"[{today}] 이미 오늘 질문을 보냈습니다. 건너뜁니다.")
-        return
-
-    # 이미 오늘 메시지를 보낸 적이 있으면 질문 생략
-    if state.get("today_page_date") == today and state.get("today_messages"):
-        logger.info(f"[{today}] 이미 오늘 메시지가 있어 질문을 건너뜁니다.")
-        state["last_question_date"] = today
-        save_state(state)
-        return
-
-    text = (
-        f"📅 {today}\n\n"
-        f"오늘은 무슨 일을 하셨나요?\n"
-        f"(What did you do today?) ✍️"
-    )
-
-    await context.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=text)
-
-    state["last_question_date"] = today
-    save_state(state)
-
-    logger.info(f"[{today}] 일기 질문을 발송했습니다.")
+NOTION_HEADERS = {
+    "Authorization": f"Bearer {NOTION_TOKEN}",
+    "Content-Type": "application/json",
+    "Notion-Version": "2022-06-28",
+}
 
 
 # ─────────────────────────────────────────────
-# 답변 수신 → AI 요약 → Notion 저장
+# 메시지 수신 → 상세DB에 즉시 기록
 # ─────────────────────────────────────────────
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # 지정한 Chat ID 에서 온 메시지만 처리
     if update.effective_chat.id != TELEGRAM_CHAT_ID:
         return
 
@@ -112,55 +89,184 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not reply_text.strip():
         return
 
+    now = datetime.now(KST)
+    today = str(now.date())
+    time_str = now.strftime("%H:%M")
+
     state = load_state()
-    today = str(datetime.now(KST).date())
 
     # 날짜가 바뀌었으면 상태 초기화
     if state.get("today_page_date") != today:
         state["today_page_id"] = None
         state["today_page_date"] = today
-        state["today_messages"] = []
 
-    is_first = state.get("today_page_id") is None
-
-    # ── 처리 중 메시지 ──
-    if is_first:
-        await update.message.reply_text("⏳ 일기를 정리하고 있어요...")
-    else:
-        await update.message.reply_text("⏳ 추가 내용을 저장하고 있어요...")
-
-    # ── 메시지 누적 ──
-    state.setdefault("today_messages", [])
-    state["today_messages"].append(reply_text)
-
-    # ── 전체 메시지로 AI 요약 ──
-    all_text = "\n\n".join(state["today_messages"])
-    logger.info(f"[{today}] AI 요약 생성 중... (메시지 {len(state['today_messages'])}개)")
-    ai_summary = summarize_with_anthropic(all_text, today)
-
-    if is_first:
-        # ── 첫 메시지: Notion 페이지 생성 ──
-        logger.info(f"[{today}] Notion 페이지 생성 중...")
-        page_id, notion_url = create_notion_page(today, reply_text, ai_summary)
+    # 메인DB 페이지가 없으면 생성
+    if state.get("today_page_id") is None:
+        logger.info(f"[{today}] 메인DB 페이지 생성 중...")
+        page_id = create_main_page(today)
         state["today_page_id"] = page_id
+        save_state(state)
+
+    # 상세DB에 기록
+    page_id = state["today_page_id"]
+    success = create_detail_record(reply_text, time_str, today, page_id)
+
+    if success:
+        await update.message.reply_text(f"✅ {time_str} 기록 완료!")
     else:
-        # ── 추가 메시지: 기존 페이지에 append ──
-        page_id = state["today_page_id"]
-        logger.info(f"[{today}] Notion 페이지에 추가 중... (page_id={page_id})")
-        notion_url = append_to_notion(page_id, reply_text, all_text, ai_summary)
+        await update.message.reply_text(f"❌ 기록 실패. 로그를 확인해주세요.")
 
-    save_state(state)
+    logger.info(f"[{today} {time_str}] 기록 {'성공' if success else '실패'}: {reply_text[:50]}")
 
-    # ── 완료 메시지 ──
-    result_msg = (
-        f"✅ {'저장' if is_first else '추가 저장'} 완료!\n\n"
-        f"🤖 *AI 요약:*\n{ai_summary}"
-    )
-    if notion_url:
-        result_msg += f"\n\n🔗 [Notion에서 보기]({notion_url})"
 
-    await update.message.reply_text(result_msg, parse_mode="Markdown")
-    logger.info(f"[{today}] 완료! Notion URL: {notion_url}")
+# ─────────────────────────────────────────────
+# Notion API: 메인DB 페이지 생성 (하루 단위)
+# ─────────────────────────────────────────────
+def create_main_page(date_str: str) -> str | None:
+    """메인 Daily Log DB에 날짜 페이지를 생성하고 page_id를 반환."""
+    body = {
+        "parent": {"database_id": NOTION_DATABASE_ID},
+        "properties": {
+            "내용": {
+                "title": [{"type": "text", "text": {"content": date_str}}]
+            },
+            "날짜": {
+                "date": {"start": date_str}
+            },
+        },
+    }
+
+    try:
+        resp = requests.post(
+            "https://api.notion.com/v1/pages",
+            headers=NOTION_HEADERS, json=body, timeout=15,
+        )
+        resp.raise_for_status()
+        return resp.json().get("id")
+    except Exception as e:
+        logger.error(f"메인DB 페이지 생성 오류: {e}")
+        return None
+
+
+# ─────────────────────────────────────────────
+# Notion API: 상세DB에 기록 추가
+# ─────────────────────────────────────────────
+def create_detail_record(text: str, time_str: str, date_str: str, main_page_id: str | None) -> bool:
+    """상세DB에 개별 기록을 추가."""
+    title = f"{time_str} | {text}"
+    if len(title) > 200:
+        title = title[:197] + "..."
+
+    properties = {
+        "이름": {
+            "title": [{"type": "text", "text": {"content": title}}]
+        },
+        "시작 시간": {
+            "rich_text": [{"type": "text", "text": {"content": time_str}}]
+        },
+        "메모": {
+            "rich_text": [{"type": "text", "text": {"content": text}}]
+        },
+        "날짜(Daily Log 연결)": {
+            "date": {"start": date_str}
+        },
+    }
+
+    if main_page_id:
+        properties["Daily Log DB"] = {
+            "relation": [{"id": main_page_id}]
+        }
+
+    body = {
+        "parent": {"database_id": NOTION_DETAIL_DB_ID},
+        "properties": properties,
+    }
+
+    try:
+        resp = requests.post(
+            "https://api.notion.com/v1/pages",
+            headers=NOTION_HEADERS, json=body, timeout=15,
+        )
+        resp.raise_for_status()
+        return True
+    except Exception as e:
+        logger.error(f"상세DB 기록 오류: {e}")
+        return False
+
+
+# ─────────────────────────────────────────────
+# Notion API: 오늘 상세 기록 조회
+# ─────────────────────────────────────────────
+def get_today_records(date_str: str) -> list[dict]:
+    """상세DB에서 해당 날짜의 기록을 시간순으로 조회."""
+    body = {
+        "filter": {
+            "property": "날짜(Daily Log 연결)",
+            "date": {"equals": date_str}
+        },
+        "sorts": [{"property": "시작 시간", "direction": "ascending"}],
+    }
+
+    try:
+        resp = requests.post(
+            f"https://api.notion.com/v1/databases/{NOTION_DETAIL_DB_ID}/query",
+            headers=NOTION_HEADERS, json=body, timeout=15,
+        )
+        resp.raise_for_status()
+        return resp.json().get("results", [])
+    except Exception as e:
+        logger.error(f"상세DB 조회 오류: {e}")
+        return []
+
+
+def format_records_for_summary(records: list[dict]) -> str:
+    """조회된 기록을 AI 요약용 텍스트로 변환."""
+    lines = []
+    for r in records:
+        props = r.get("properties", {})
+        time_val = ""
+        time_rt = props.get("시작 시간", {}).get("rich_text", [])
+        if time_rt:
+            time_val = time_rt[0].get("plain_text", "")
+
+        memo_val = ""
+        memo_rt = props.get("메모", {}).get("rich_text", [])
+        if memo_rt:
+            memo_val = memo_rt[0].get("plain_text", "")
+
+        if time_val and memo_val:
+            lines.append(f"{time_val} | {memo_val}")
+        elif memo_val:
+            lines.append(memo_val)
+
+    return "\n".join(lines)
+
+
+# ─────────────────────────────────────────────
+# Notion API: 메인DB 일기 필드 업데이트
+# ─────────────────────────────────────────────
+def update_main_page_summary(page_id: str, ai_summary: str):
+    """메인DB 페이지의 '일기' 속성을 AI 요약으로 갱신."""
+    content = ai_summary
+    if len(content) > 2000:
+        content = content[:1997] + "..."
+
+    body = {
+        "properties": {
+            "일기": {
+                "rich_text": [{"type": "text", "text": {"content": content}}]
+            }
+        }
+    }
+
+    try:
+        resp = requests.patch(
+            f"https://api.notion.com/v1/pages/{page_id}",
+            headers=NOTION_HEADERS, json=body, timeout=15,
+        )
+        resp.raise_for_status()
+    except Exception as e:
+        logger.error(f"메인DB 요약 갱신 오류: {e}")
 
 
 # ─────────────────────────────────────────────
@@ -175,8 +281,8 @@ def summarize_with_anthropic(text: str, date_str: str) -> str:
             messages=[{
                 "role": "user",
                 "content": (
-                    f"다음은 {date_str}의 하루 일기입니다.\n"
-                    f"한국어로 핵심 내용과 주요 업무/하이라이트를 "
+                    f"다음은 {date_str}의 활동 기록입니다.\n"
+                    f"한국어로 핵심 내용과 주요 활동을 "
                     f"2-4개의 bullet point (• 기호 사용)로 간결하게 요약해주세요:\n\n{text}"
                 )
             }]
@@ -188,125 +294,49 @@ def summarize_with_anthropic(text: str, date_str: str) -> str:
 
 
 # ─────────────────────────────────────────────
-# Notion API 공통 헤더
+# 오후 5시: 질문 발송 + 하루 요약
 # ─────────────────────────────────────────────
-NOTION_HEADERS = {
-    "Authorization": f"Bearer {NOTION_TOKEN}",
-    "Content-Type": "application/json",
-    "Notion-Version": "2022-06-28",
-}
+async def send_daily_question(context: ContextTypes.DEFAULT_TYPE):
+    today = str(datetime.now(KST).date())
+    state = load_state()
 
+    if state.get("last_question_date") == today:
+        logger.info(f"[{today}] 이미 오늘 질문을 보냈습니다. 건너뜁니다.")
+        return
 
-# ─────────────────────────────────────────────
-# Notion API: 페이지 생성 (첫 메시지)
-# ─────────────────────────────────────────────
-def create_notion_page(date_str: str, reply_text: str, ai_summary: str) -> tuple[str | None, str]:
-    """Notion 데이터베이스에 새 페이지를 생성하고 (page_id, url) 반환."""
-    body = {
-        "parent": {"database_id": NOTION_DATABASE_ID},
-        "properties": {
-            "내용": {
-                "title": [{"type": "text", "text": {"content": date_str}}]
-            },
-            "날짜": {
-                "date": {"start": date_str}
-            },
-            "일기": {
-                "rich_text": [{
-                    "type": "text",
-                    "text": {
-                        "content": f"📝 원문:\n{reply_text}\n\n🤖 AI 요약:\n{ai_summary}"
-                    }
-                }]
-            },
-        },
-        "children": [
-            {
-                "object": "block", "type": "heading_2",
-                "heading_2": {"rich_text": [{"type": "text", "text": {"content": "📝 원문 답변"}}]}
-            },
-            {
-                "object": "block", "type": "paragraph",
-                "paragraph": {"rich_text": [{"type": "text", "text": {"content": reply_text}}]}
-            },
-            {"object": "block", "type": "divider", "divider": {}},
-            {
-                "object": "block", "type": "heading_2",
-                "heading_2": {"rich_text": [{"type": "text", "text": {"content": "🤖 AI 요약"}}]}
-            },
-            {
-                "object": "block", "type": "paragraph",
-                "paragraph": {"rich_text": [{"type": "text", "text": {"content": ai_summary}}]}
-            },
-        ],
-    }
+    # 질문 발송 (항상)
+    question_text = (
+        f"📅 {today}\n\n"
+        f"오늘은 무슨 일을 하셨나요?\n"
+        f"(What did you do today?) ✍️"
+    )
+    await context.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=question_text)
 
-    try:
-        resp = requests.post(
-            "https://api.notion.com/v1/pages",
-            headers=NOTION_HEADERS, json=body, timeout=15,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        return data.get("id"), data.get("url", "")
-    except Exception as e:
-        logger.error(f"Notion 페이지 생성 오류: {e}")
-        return None, ""
+    state["last_question_date"] = today
+    save_state(state)
+    logger.info(f"[{today}] 일기 질문을 발송했습니다.")
 
+    # 오늘 기록이 있으면 AI 요약 생성
+    records = get_today_records(today)
+    if not records:
+        logger.info(f"[{today}] 오늘 기록이 없어 요약을 건너뜁니다.")
+        return
 
-# ─────────────────────────────────────────────
-# Notion API: 기존 페이지에 추가 (추가 메시지)
-# ─────────────────────────────────────────────
-def append_to_notion(page_id: str, new_text: str, all_text: str, ai_summary: str) -> str:
-    """기존 Notion 페이지에 추가 원문 블록을 append 하고, 일기 속성(요약)을 갱신."""
-    notion_url = ""
+    records_text = format_records_for_summary(records)
+    logger.info(f"[{today}] AI 요약 생성 중... ({len(records)}개 기록)")
+    ai_summary = summarize_with_anthropic(records_text, today)
 
-    # 1) 블록 append: 추가 원문
-    append_body = {
-        "children": [
-            {"object": "block", "type": "divider", "divider": {}},
-            {
-                "object": "block", "type": "paragraph",
-                "paragraph": {"rich_text": [{"type": "text", "text": {"content": f"📝 추가:\n{new_text}"}}]}
-            },
-        ]
-    }
-    try:
-        resp = requests.patch(
-            f"https://api.notion.com/v1/blocks/{page_id}/children",
-            headers=NOTION_HEADERS, json=append_body, timeout=15,
-        )
-        resp.raise_for_status()
-    except Exception as e:
-        logger.error(f"Notion 블록 append 오류: {e}")
+    # 메인DB에 요약 저장
+    page_id = state.get("today_page_id")
+    if page_id:
+        update_main_page_summary(page_id, ai_summary)
+        logger.info(f"[{today}] 메인DB에 요약 저장 완료.")
 
-    # 2) 일기 속성 갱신: 전체 원문 + 새 요약
-    summary_content = f"📝 원문:\n{all_text}\n\n🤖 AI 요약:\n{ai_summary}"
-    # Notion rich_text 속성은 최대 2000자
-    if len(summary_content) > 2000:
-        summary_content = summary_content[:1997] + "..."
-
-    update_body = {
-        "properties": {
-            "일기": {
-                "rich_text": [{
-                    "type": "text",
-                    "text": {"content": summary_content}
-                }]
-            }
-        }
-    }
-    try:
-        resp = requests.patch(
-            f"https://api.notion.com/v1/pages/{page_id}",
-            headers=NOTION_HEADERS, json=update_body, timeout=15,
-        )
-        resp.raise_for_status()
-        notion_url = resp.json().get("url", "")
-    except Exception as e:
-        logger.error(f"Notion 속성 갱신 오류: {e}")
-
-    return notion_url
+    # 텔레그램에 요약 전송
+    summary_msg = f"📊 *오늘의 요약* ({len(records)}개 기록)\n\n{ai_summary}"
+    await context.bot.send_message(
+        chat_id=TELEGRAM_CHAT_ID, text=summary_msg, parse_mode="Markdown"
+    )
 
 
 # ─────────────────────────────────────────────
