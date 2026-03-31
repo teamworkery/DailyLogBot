@@ -57,7 +57,7 @@ def load_state() -> dict:
         with open(STATE_FILE, encoding="utf-8") as f:
             return json.load(f)
     return {
-        "last_question_date": None,
+        "last_summary_date": None,
         "today_page_id": None,
         "today_page_date": None,
     }
@@ -281,9 +281,12 @@ def summarize_with_anthropic(text: str, date_str: str) -> str:
             messages=[{
                 "role": "user",
                 "content": (
-                    f"다음은 {date_str}의 활동 기록입니다.\n"
-                    f"한국어로 핵심 내용과 주요 활동을 "
-                    f"2-4개의 bullet point (• 기호 사용)로 간결하게 요약해주세요:\n\n{text}"
+                    f"다음은 {date_str}에 시간순으로 기록된 하루 활동 로그입니다.\n\n"
+                    f"{text}\n\n"
+                    f"위 기록에서 **업무·작업 관련 내용만** 추려서, "
+                    f"시간 흐름 순서대로 2-5개의 bullet point (• 기호 사용)로 요약해주세요.\n"
+                    f"기상, 식사, 샤워, 산책 등 일상 루틴은 제외하고 "
+                    f"실제로 수행한 업무와 성과 위주로 간결하게 작성해주세요."
                 )
             }]
         )
@@ -294,36 +297,25 @@ def summarize_with_anthropic(text: str, date_str: str) -> str:
 
 
 # ─────────────────────────────────────────────
-# 오후 5시: 질문 발송 + 하루 요약
+# 오후 5시: 하루 업무 요약 자동 생성
 # ─────────────────────────────────────────────
-async def send_daily_question(context: ContextTypes.DEFAULT_TYPE):
+async def send_daily_summary(context: ContextTypes.DEFAULT_TYPE):
     today = str(datetime.now(KST).date())
     state = load_state()
 
-    if state.get("last_question_date") == today:
-        logger.info(f"[{today}] 이미 오늘 질문을 보냈습니다. 건너뜁니다.")
+    if state.get("last_summary_date") == today:
+        logger.info(f"[{today}] 이미 오늘 요약을 생성했습니다. 건너뜁니다.")
         return
 
-    # 질문 발송 (항상)
-    question_text = (
-        f"📅 {today}\n\n"
-        f"오늘은 무슨 일을 하셨나요?\n"
-        f"(What did you do today?) ✍️"
-    )
-    await context.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=question_text)
-
-    state["last_question_date"] = today
-    save_state(state)
-    logger.info(f"[{today}] 일기 질문을 발송했습니다.")
-
-    # 오늘 기록이 있으면 AI 요약 생성
+    # 오늘 기록 조회
     records = get_today_records(today)
     if not records:
         logger.info(f"[{today}] 오늘 기록이 없어 요약을 건너뜁니다.")
         return
 
+    # AI 업무 요약 생성
     records_text = format_records_for_summary(records)
-    logger.info(f"[{today}] AI 요약 생성 중... ({len(records)}개 기록)")
+    logger.info(f"[{today}] AI 업무 요약 생성 중... ({len(records)}개 기록)")
     ai_summary = summarize_with_anthropic(records_text, today)
 
     # 메인DB에 요약 저장
@@ -333,10 +325,11 @@ async def send_daily_question(context: ContextTypes.DEFAULT_TYPE):
         logger.info(f"[{today}] 메인DB에 요약 저장 완료.")
 
     # 텔레그램에 요약 전송
-    summary_msg = f"📊 *오늘의 요약* ({len(records)}개 기록)\n\n{ai_summary}"
-    await context.bot.send_message(
-        chat_id=TELEGRAM_CHAT_ID, text=summary_msg, parse_mode="Markdown"
-    )
+    summary_msg = f"📋 {today} 업무 요약\n\n{ai_summary}"
+    await context.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=summary_msg)
+
+    state["last_summary_date"] = today
+    save_state(state)
 
 
 # ─────────────────────────────────────────────
@@ -344,7 +337,7 @@ async def send_daily_question(context: ContextTypes.DEFAULT_TYPE):
 # ─────────────────────────────────────────────
 def main():
     logger.info("🤖 Daily Journal Bot 시작!")
-    logger.info(f"📅 매일 {QUESTION_HOUR:02d}:{QUESTION_MINUTE:02d}에 질문을 발송합니다.")
+    logger.info(f"📅 매일 {QUESTION_HOUR:02d}:{QUESTION_MINUTE:02d}에 업무 요약을 생성합니다.")
 
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
@@ -353,10 +346,10 @@ def main():
 
     # 매일 지정 시간에 질문 발송 (KST 기준)
     app.job_queue.run_daily(
-        callback=send_daily_question,
+        callback=send_daily_summary,
         time=time(hour=QUESTION_HOUR, minute=QUESTION_MINUTE, second=0, tzinfo=KST),
         days=(0, 1, 2, 3, 4, 5, 6),
-        name="daily_question",
+        name="daily_summary",
     )
 
     # 봇 실행 (long polling)
