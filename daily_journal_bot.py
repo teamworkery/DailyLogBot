@@ -100,10 +100,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         state["today_page_id"] = None
         state["today_page_date"] = today
 
-    # 메인DB 페이지가 없으면 생성
+    # 메인DB 페이지가 없으면 조회 후 생성
     if state.get("today_page_id") is None:
-        logger.info(f"[{today}] 메인DB 페이지 생성 중...")
-        page_id = create_main_page(today)
+        page_id = get_or_create_main_page(today)
         state["today_page_id"] = page_id
         save_state(state)
 
@@ -120,10 +119,39 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ─────────────────────────────────────────────
-# Notion API: 메인DB 페이지 생성 (하루 단위)
+# Notion API: 메인DB 페이지 조회 또는 생성 (하루 단위)
 # ─────────────────────────────────────────────
-def create_main_page(date_str: str) -> str | None:
-    """메인 Daily Log DB에 날짜 페이지를 생성하고 page_id를 반환."""
+def find_main_page(date_str: str) -> str | None:
+    """메인DB에서 해당 날짜 페이지를 찾아 page_id를 반환. 없으면 None."""
+    body = {
+        "filter": {
+            "property": "날짜",
+            "date": {"equals": date_str}
+        },
+    }
+
+    try:
+        resp = requests.post(
+            f"https://api.notion.com/v1/databases/{NOTION_DATABASE_ID}/query",
+            headers=NOTION_HEADERS, json=body, timeout=15,
+        )
+        resp.raise_for_status()
+        results = resp.json().get("results", [])
+        if results:
+            return results[0].get("id")
+    except Exception as e:
+        logger.error(f"메인DB 조회 오류: {e}")
+    return None
+
+
+def get_or_create_main_page(date_str: str) -> str | None:
+    """메인DB에서 해당 날짜 페이지를 찾고, 없으면 새로 생성."""
+    page_id = find_main_page(date_str)
+    if page_id:
+        logger.info(f"[{date_str}] 기존 메인DB 페이지 사용: {page_id}")
+        return page_id
+
+    logger.info(f"[{date_str}] 메인DB 페이지 생성 중...")
     body = {
         "parent": {"database_id": NOTION_DATABASE_ID},
         "properties": {
@@ -319,7 +347,7 @@ async def send_daily_summary(context: ContextTypes.DEFAULT_TYPE):
     ai_summary = summarize_with_anthropic(records_text, today)
 
     # 메인DB에 요약 저장
-    page_id = state.get("today_page_id")
+    page_id = state.get("today_page_id") or find_main_page(today)
     if page_id:
         update_main_page_summary(page_id, ai_summary)
         logger.info(f"[{today}] 메인DB에 요약 저장 완료.")
